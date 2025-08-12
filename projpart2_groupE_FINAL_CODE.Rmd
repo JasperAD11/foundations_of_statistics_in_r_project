@@ -1,0 +1,718 @@
+---
+title: "Further Investigation on Impact of Plus Program in Airbnb Performance" 
+author: "Ana Ferreira, Anna-Maria Fiederling, Jasper Sänger, Paulo Cheng"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+    toc: false
+    number_sections: false
+fontsize: 12pt
+geometry: margin=1in
+linestretch: 1.5
+mainfont: Times New Roman
+---
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.45\textwidth, height=2.5cm]{airbnb.png} 
+  \hspace{1cm} 
+  \includegraphics[width=0.45\textwidth, height=2.5cm]{catolica.png} 
+\end{figure}
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, error = FALSE, message = FALSE)
+Sys.setlocale("LC_TIME","en_US.UTF-8")
+
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(kableExtra)
+library(infer)
+library(janitor)
+library(stargazer)
+library(plm) 
+library(lmtest) 
+library(performance)
+library(patchwork)
+library(tsibble)
+
+theme_set(theme_minimal())
+
+data <- read_csv("airbnb_data_clean.csv")
+```
+
+```{r select_var, include = FALSE}
+# Categorical variable with city name - Identified by searching zipcodes online
+data <- data %>% mutate(city_name = if_else(city_number == 4, "Denver", 
+                                    if_else(city_number == 5, "Nashville", 
+                                    if_else(city_number == 6, "New Orleans", 
+                                    if_else(city_number == 9, "San Francisco", 
+                                    if_else(city_number == 11, "Washington DC", "Others"))))))
+
+
+data$date = as.Date(as.Date("2017-08-01") + months(data$timeperiod - 8), "%Y %m")
+
+data_clean <- data %>% 
+  select(booking_rate, listing_avg_review, zipcode, timeperiod, date, city_number, city_name, policy_entry, treated,
+  # new variables
+  price_mean, total_population, search_trend_airbnb, entire_ratio, business_ratio, instant_ratio, super_host_ratio)
+```
+
+```{r, include=FALSE}
+# Looking for outliers
+p1 = ggplot(data_clean, aes(x = price_mean)) + geom_boxplot()
+p2 = ggplot(data_clean, aes(x = search_trend_airbnb)) + geom_boxplot()
+p3 = ggplot(data_clean, aes(x = entire_ratio)) + geom_boxplot()
+p4 = ggplot(data_clean, aes(x = listing_avg_review)) + geom_boxplot()
+
+(p1 + p2) / (p3 + p4)
+rm(p1, p2, p3, p4)
+```
+
+```{r data_cleaning, include=FALSE}
+# Treating listing_avg_review value 0 as NA
+data_clean <- data_clean %>%
+  mutate(listing_avg_review = if_else(listing_avg_review <= 0, NA, listing_avg_review))
+
+# Mean imputation for missing values
+mean_na <- data_clean %>% group_by(city_name, timeperiod) %>% 
+  summarize(input_br = mean(booking_rate, na.rm = TRUE),
+            input_lar = mean(listing_avg_review, na.rm = TRUE),
+            input_pm = mean(price_mean, na.rm=TRUE),
+            input_tp = mean(total_population, na.rm=TRUE))
+
+# Filling missings in the mean table
+mean_na <- mean_na %>% fill(input_br, .direction = "up")
+
+data_clean <- data_clean %>%
+  left_join(mean_na) %>%
+  mutate(booking_rate = if_else(is.na(booking_rate), input_br, booking_rate),
+         listing_avg_review = if_else(is.na(listing_avg_review), input_lar, listing_avg_review),
+         price_mean = if_else(is.na(price_mean), input_pm, price_mean),
+         total_population = if_else(is.na(total_population), input_tp, total_population)) %>%
+  select(-input_br, -input_lar, -input_pm, -input_tp)
+
+# Creating an artificial row for each time period in Denver - time period = 17 in order to not have an overall gap in time
+data_artificial <- data_clean %>% filter(city_name == "Denver" & timeperiod %in% c(16, 18))
+artificial_row <- data_artificial %>% select(-city_name, -timeperiod) %>% group_by(zipcode) %>% summarize(across(everything(), mean))
+artificial_row <- artificial_row %>% mutate(city_name = "Denver", timeperiod = 17)
+data_clean <- rbind(data_clean, artificial_row)
+
+# Zicodes inconsistences
+data_zip <- data_clean %>% group_by(zipcode) %>%
+  summarise(max_t = max(timeperiod), min_t = min(timeperiod))
+n_early <- nrow(data_zip %>% filter(max_t < 34))
+n_late <- nrow(data_zip %>% filter(min_t >= 16)) 
+# 98 zipcodes left the data before period 34
+# 507 zipcodes only entered on period 16 or after
+
+
+# Imputing the next minimum value to the outlier for listing_avg_review
+min_review <- data_clean %>% filter(listing_avg_review >= 70)
+data_clean <- data_clean %>% 
+  mutate(listing_avg_review = ifelse(listing_avg_review < 70, min(min_review$listing_avg_review), listing_avg_review))
+
+# Variable to distinguish from no, 1st and 2nd impl
+data_clean <- data_clean %>% 
+  mutate(plus = if_else(city_name == 'Others', 'No impl', 
+                if_else(city_name == 'San Francisco', '1st impl', '2nd impl')))
+
+```
+
+```{r remove_memory, include=FALSE}
+rm(artificial_row, data, data_artificial, mean_na, var_na, check_na_var, data_zip, min_review)
+gc()
+```
+
+\vspace{30pt}
+# Introduction
+
+Previous exploratory data analysis and hypothesis testing, to evaluate the impact of the program and determine whether differentiating high-quality services contributes to improved platform performance, indicated that the implementation of Airbnb Plus Program yielded a general positive impact on the booking rates in San Francisco, the pilot market subjected to Airbnb Plus Program roll-out. This result was not replicated for cities in the second implementation period, where hypothesis tests returned no significant improvement in market outcome variables. 
+
+In this study, to further scrutinize the effect of the Airbnb Plus Program and build on previously established hypotheses, regression modelling is applied using the Difference in Difference framework, identifying differences before and after treatment for treated and control groups.
+
+\newpage
+
+# Hypotheses
+
+In the previous investigation, a short series of hypothesis testing was conducted in order to test the explored assumptions related to the question of interest. 
+
+The alternative for the first hypothesis stated the following:
+
+**$H_a:$ The booking rate mean before Plus implementation is smaller than that after implementation.**
+
+```{r, include = FALSE}
+data_test <- data_clean %>% filter(city_name != "Others")
+
+table_test <- data_test %>% group_by(policy_entry) %>% summarize(Mean = mean(booking_rate), SD = sd(booking_rate))
+
+knitr::kable(table_test, digits = 2) 
+
+test <- data_test %>% t_test(booking_rate ~ policy_entry, order = c("0", "1"), alternative = "less")
+knitr::kable(test)
+```
+
+The results for this test showed a p-value extremely small, close to 0. Thus, the observed difference between the two group means is statistically significant at a 95% confidence level, leading to reject the null hypothesis of equality of means (p<0.05).
+
+The second hypothesis tested the strength of the relationship between booking rates and the implementation of the Plus program in Denver, Nashville, New Orleans and Washington DC, the cities of the second implementation of the program.
+
+**$H_a:$ There is a significant relationship between the booking rate and the implementation of the Plus program.** *(β1 ≠ 0)*
+
+```{r , include = FALSE}
+data_test <- data_clean %>% filter(city_name != "San Francisco" & city_name != "Others") %>% mutate(plus = if_else(timeperiod < 22, "Before", "After"))
+
+table_test <- data_test %>% group_by(plus) %>% summarize(Mean = mean(booking_rate), SD = sd(booking_rate)) 
+
+knitr::kable(table_test, digits = 2) 
+
+model_testing <- lm(booking_rate ~ plus, data = data_test)
+stargazer(model_testing, type = "latex", omit.stat = c("f", "adj.rsq"), no.space = TRUE, header = FALSE, title = "Relation Between Booking Rate and Plus Program")
+```
+
+Even thought β1 ≠ 0 (-0.0023), the p-value for this coefficient was greater than 0.05. At a 95% confidence level, the coefficient is not statistically significant, indicating not enough statistical evidence that there is a significant relationship between the two variables.
+
+Finally, the alternative for the third hypothesis stated the following:
+
+**$H_a:$ The average review mean for the second stage cities is different before and after the plus implementation.**
+
+```{r , include = FALSE}
+data_test <- data_clean %>% filter(city_name != "San Francisco" & city_name != "Others")
+
+table_test <- data_test %>% group_by(policy_entry) %>% summarize(Mean = mean(listing_avg_review), SD = sd(listing_avg_review)) 
+
+knitr::kable(table_test, digits = 2)
+
+test <- data_test %>% t_test(listing_avg_review ~ policy_entry, order = c("0", "1"))
+knitr::kable(test)
+```
+
+The p-value of the test was greater than 0.05. So at a 95% confidence level, there is no evidence of significant difference between the means, leading to fail to reject the null hypothesis of equality of means.
+
+In summary, the Plus program seem to have significantly improved overall booking rates. However, no significant relationship was found between the program and increased booking rates in Nashville, New Orleans, Washington DC, and Denver *(second treatment group)*, leading to the conclusion that the previous result was influenced by a positive result in the first implementation in San Francisco. Additionally, there was no evidence to suggest a difference in customer satisfaction, as measured by average listing reviews, in the second group cities. These findings establish the baseline scope and motivation of the preceding report.
+
+```{r , include=FALSE}
+rm(data_test, model_testing, table_test, test)
+gc()
+```
+
+# Model Specification 
+
+```{r controls, include=FALSE}
+# Big city var
+pop_data <- data_clean %>% group_by(city_number, zipcode) %>% summarize(pop = mean(total_population)) %>% group_by(city_number) %>% summarise(city_pop = sum(pop))
+data_clean <- left_join(data_clean, pop_data)
+data_clean <- data_clean %>% mutate(big_city = if_else(city_pop > 1000000, 'Yes', 'No')) %>% select(-city_pop)
+rm(pop_data)
+```
+
+A fixed effects model was chosen in order to account for differing time periods of policy implementation, unique zip code characteristics and the unbalance in the data across these two indexes *(time period & zip code)*.
+
+Given that, the model for `booking_rate` is specified as follows:
+$$
+\scriptsize
+{\text{Booking Rate}}_{it}
+= \beta_0
++ \beta_1{\text{Policy}}_{it}
++ \beta_2{\text{Plus}}_{it} * {\text{Policy}}_{it}
++ \beta_3{\text{Big City}}_{it} * {\text{Policy}}_{it}
++ \beta_{4,\ldots, k}{\text{control}}_{it}
++ \gamma_i
++ \delta_t
++ \epsilon_{it}
+$$
+The model for `listing_avg_review` is specified as follows:
+$$
+\scriptsize
+{\text{Average Review}_{it}}
+= \beta_0
++ \beta_1{\text{Policy}}_{it}
++ \beta_2{\text{Plus}}_{it} * {\text{Policy}}_{it}
++ \beta_3{\text{Big City}}_{it} * {\text{Policy}}_{it}
++ \beta_{4,\ldots, k}{\text{control}}_{it}
++ \gamma_i
++ \delta_t
++ \epsilon_{it}
+$$
+Equations valid for k-4 control variables, that in this case corresponds to the same three for both models: `search_trend_airbnb`, `entire_ratio` and `super_host_ratio`. $\gamma_i$ represents the `timeperiod` dummies and $\delta_t$ the id dummies, in this case `zipcode`. Two variables were created: `big_city`, a binary variable *(1 for cities with populations over 1 million, 0 otherwise)*, and `plus`, a categorical variable with three levels *(1st impl, 2nd impl, No impl)* indicating the program implementation phase or lack thereof.
+
+# Dataset Overview & Model-Free Investigation
+
+The final cleaned data set has a total of `r nrow(data_clean)` observations across `r ncol(data_clean)` variables. It covers `r n_distinct(data_clean$zipcode)` zipcodes within `r n_distinct(data_clean$city_number)` US cities from the beginning of August 2017 *(timperiod = 8)*  to the end of October 2019 *(timperiod = 34)*.
+
+The data cleaning process involved a deep dive into the data, looking at distributions, missing values, presence of outliers and inconsistencies for the relevant variables. For the variable `listing_avg_review`, an unlikely large number of value "0" was present. These were assumed to be NA values and treated as such. For the same variable, one outlier was treated by imputing the next closest minimum value.
+
+Inconsistencies in the indexes *(zip codes across time periods)* were identified and showcased an unbalanced panel data set. `r n_late` zip codes have entries past April 2018 only and `r n_early` zip codes left the data set before the last time period. Some zip codes have entry gaps in between first and last observed time periods. For one collection of zip codes which belong to the city Denver, an entire gap in entries for the time period equivalent to May 2018 was present. As this seem to be different from the other observed gaps, it was treated by creating an artificial row for each zip code with imputed values derived from the mean between the prior and preceding month across all variables.
+
+For the scope of this research, the data analysis that will follow will be mainly focused in the outcome variables of interest: `booking_rate` and `listing_avg_review`, their evolution over time, trend and relations with other important features.
+
+```{r}
+relevant_columns <- data_clean %>% 
+  select(booking_rate, listing_avg_review, policy_entry, search_trend_airbnb, entire_ratio, super_host_ratio)
+
+summary_table <- relevant_columns %>%
+  summarise(
+    Variable = colnames(.),
+    N = sapply(., function(x) sum(!is.na(x))),
+    Mean = sapply(., mean, na.rm = TRUE),
+    St.Dev. = sapply(., sd, na.rm = TRUE),
+    Min = sapply(., min, na.rm = TRUE),
+    `Pctl(25)` = sapply(., function(x) quantile(x, 0.25, na.rm = TRUE)),
+    Median = sapply(., median, na.rm = TRUE),
+    `Pctl(75)` = sapply(., function(x) quantile(x, 0.75, na.rm = TRUE)),
+    Max = sapply(., max, na.rm = TRUE)
+  ) %>%
+  as.data.frame()
+
+kable(summary_table, 
+      caption = "Summary Statistics",
+      col.names = c("Variable", "N", "Mean", "St.Dev.", "Min", "25%", "Median", "75%", "Max"),
+      digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), 
+                full_width = FALSE, 
+                font_size = 12)
+```
+
+In the summary statistics table above, `booking_rate` across all time periods and zip codes in the cleaned data set displays a mean of 0.23. The `listing_avg_review` key variable indicates good reviews, with a high mean score of 95 and values ranging only from 70 to 100. The variable `booking_rate` displays a negative minimum value. This could suggest data entry errors and will be addressed in the assumptions sections in more detail.The variable `search_trend_airbnb` ranges from 3.76 to 19.75 with the mean value being 6.47. It is also possible to conclude that 15% of the zipcodes present had the Plus program introduced, 59% of listings offer entire apartments and 18% have a super host.
+
+```{r histogram, fig.height=2.5}
+# Distribution Booking rate
+hist_booking = ggplot(data_clean, aes(x = booking_rate)) +
+  geom_histogram(colour = 'grey50', fill = 'grey50') + 
+  labs(x='Booking Rate', y='Count', title = 'Distribution for Booking Rate') +
+  theme(text = element_text(size=10), legend.position= "bottom",
+        plot.title = element_text(size = 12),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8)) +
+  ylim(0, 2500)
+
+# Distribution review 
+hist_listing = ggplot(data_clean, aes(x = listing_avg_review)) +
+  geom_histogram(colour = 'grey50', fill = 'grey50') +
+  labs(x='Listing Average Review', title = 'Distribution for Average Review') +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 12),
+       axis.title.x = element_text(size = 8),
+       axis.title.y = element_blank(),
+       axis.text.y = element_blank()) +
+  xlim(75, 100) +
+  ylim(0, 2500)
+
+hist_booking + hist_listing
+```
+
+The `booking_rate` distribution is approximately normal, with few values near the extremes 0 or 1, indicating most rates are moderate. The `listing_avg_review` distribution is left-skewed, mainly concentrated above 90, with a near-normal shape within that range. 
+
+```{r, fig.height=2}
+booking_trend = ggplot(data_clean, aes(x = yearmonth(date), y = booking_rate)) +
+  geom_point(colour = 'grey50') +
+  stat_smooth(colour = 'lightblue3') +
+  labs(y='Booking Rate', title='Trend of Booking Rate') +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+       axis.title.x = element_blank(),
+       axis.title.y = element_text(size = 8))
+
+avg_trend = ggplot(data_clean, aes(x = yearmonth(date), y = listing_avg_review)) +
+  geom_point(colour = 'grey50') +
+  stat_smooth(colour = 'lightblue3') +
+  labs(y='Average Review', title = 'Trend of Average Review') +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+       axis.title.x = element_blank(),
+       axis.title.y = element_text(size = 8))
+
+booking_trend 
+avg_trend
+```
+
+The trend line for booking rates displays minor fluctuations over time. `booking_rate` remain relatively stable with slight dips in February 2018 and November 2018, periods that coincide approximately with program implementation. `listing_avg_review` are consistently high with a slight upward trend over time. There is some presence of outliers but those do not seem to influence the trend line drastically.
+
+```{r treatment, include=FALSE}
+data_treatment <- data_clean %>% 
+  group_by(city_name) %>% 
+  mutate(treated = max(policy_entry))
+
+gg1 = ggplot(data_treatment, aes(x = factor(date), y = booking_rate, fill = factor(treated))) + 
+  geom_boxplot() +
+  theme_minimal() +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8), 
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1), 
+    axis.text.y = element_text(size = 8)) +
+  labs(x = 'Time (Date)',
+       y = 'Booking Rate',
+       fill = 'Treated') 
+
+
+gg2 = ggplot(data_treatment, aes(x = factor(date), y = listing_avg_review, fill = factor(treated))) + 
+  geom_boxplot() +
+  theme_minimal() +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1), 
+    axis.text.y = element_text(size = 8)) + 
+  labs(x = 'Time (Date)',
+       y = 'Average Listing review',
+       fill = 'Treated') 
+
+gg1 / gg2
+```
+
+```{r evolution}
+data_did <- data_clean %>% select(plus, date, booking_rate, listing_avg_review) %>% group_by(plus, date) %>% summarize(across(everything(), mean))
+
+p1 = ggplot(data = data_did, aes(x = yearmonth(date), y = booking_rate, color = plus, group = plus)) +
+  geom_point(size=2) + geom_line(size=1) +
+  geom_vline(xintercept = as.Date("2018-02-01"), linetype="dashed", size=1) + 
+  geom_vline(xintercept=as.Date("2018-10-01"), linetype="dashed", size=1) +
+    scale_colour_manual(values = c('lightblue3', 'orange2', 'grey70')) +
+  theme(text = element_text(size=10), legend.position = "none",
+        plot.title = element_text(size = 10),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 8),
+        axis.text.x = element_text(size = 8), 
+        axis.text.y = element_text(size = 8)) +
+ labs(y= "Booking Rate", title ="Evolution of Booking Rate")
+
+
+p2 = ggplot(data = data_did, aes(x = yearmonth(date), y = listing_avg_review, color = plus, group = plus)) +
+  geom_point(size=2) + geom_line(size=1) +
+  geom_vline(xintercept = as.Date("2018-02-01"), linetype="dashed", size=1) + 
+  geom_vline(xintercept=as.Date("2018-10-01"), linetype="dashed", size=1) +
+  scale_colour_manual(values = c('lightblue3', 'orange2', 'grey70')) +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+       axis.title.x = element_blank(),
+       axis.title.y = element_text(size = 8),
+       axis.text.x = element_text(size = 8), 
+       axis.text.y = element_text(size = 8)) +
+ labs(y= "Average listing review", title ="Evolution of Average Review")
+
+p1 / p2
+```
+
+The top plot shows `booking_rate` over time, with the *1st impl* group consistently higher, followed by *2nd impl*. The bottom plot shows stable average listing reviews, with *2nd impl* scoring highest, followed by *1st impl*, and *No impl* consistently lowest. The significant dip to a vlue of 0% in `booking_rate` in December 2019 is likely a data collection error or an extraordinary unknown event.
+
+```{r removing, include=FALSE}
+rm(data_aggregated, p1, p2, data_treatment, data_did, gg1, gg2, avg_trend, booking_trend, hist_booking, hist_listing, relevant_columns, summary_table, n_early, n_late)
+gc()
+```
+
+\newpage
+# Regression Analysis: Estimating the Impact of Airbnb Plus
+
+```{r, include=FALSE}
+data_panel <- pdata.frame(data_clean, index=c('zipcode', 'timeperiod'))
+data_panel <- data_panel %>% mutate(policy_entry = factor(policy_entry))
+```
+
+```{r}
+# Model for booking rate
+br_fe <- plm(booking_rate ~ policy_entry + 
+                            plus*policy_entry + 
+                            big_city*policy_entry +
+                            search_trend_airbnb +
+                            entire_ratio + 
+                            super_host_ratio +
+                            timeperiod,
+             data = data_panel, model= 'within')
+#summary(br_fe)
+```
+
+```{r, include=FALSE}
+pbgtest(br_fe)
+# p-value < 0.05 so it is serial correlated - adjust standard errors
+```
+
+```{r}
+# Model for average review
+avg_re_fe <- plm(listing_avg_review ~ policy_entry + 
+                                      plus*policy_entry + 
+                                      big_city*policy_entry +
+                                      search_trend_airbnb +
+                                      entire_ratio + 
+                                      super_host_ratio +
+                                      timeperiod,
+              data = data_panel, model= 'within' )
+#summary(avg_re_fe)
+```
+
+```{r, include=FALSE}
+pbgtest(avg_re_fe)
+# p-value < 0.05 so it is serial correlated - adjust standard errors
+```
+
+After the previous analysis, the above specified models were conducted and after modelling a test for serial correlation was performed with the results indicating a p-value smaller than 0.05 leading to reject the null of no serial correlation, at a 95% confidence level. For that reason, the standard errors showed in the following models summary were corrected to be the robust one's.
+
+```{r, results='asis'}
+br_robust_se <- sqrt(diag(plm::vcovHC(br_fe, method = "arellano")))
+ar_robust_se <- sqrt(diag(plm::vcovHC(avg_re_fe, method = "arellano")))
+
+stargazer(br_fe, avg_re_fe, 
+          se = list(br_robust_se, ar_robust_se),
+          column.labels = c("Booking Rate with robust SEs", "Average Review with robust SEs"),
+          type = "latex",
+          omit.stat = c("ser","f", "adj.rsq", "rsq"),
+          omit = c('timeperiod'),
+          omit.labels = c('Time Period'),
+          model.names = FALSE,
+          dep.var.labels.include = FALSE,
+          no.space = TRUE,
+          header = FALSE,
+          title = "Fixed Effects Models")
+```
+
+*Note: For the interpretations of the models a 0.05% significance level will be considered.*
+
+According to the `booking_rate` model results, Airbnb Plus had a positive effect on the `booking_rate` during its first implementation. Holding all other factors constant, booking rate increased by an average of 0.051 units after the program started. However for the second implementation, holding all else constant, the booking rate decreased by an average of 0.009 units. Furthermore, the interaction between `policy_entry` and `big_city` *(added to examine differences in effects
+based on city characteristics)* yielded a statistically insignificant result. This indicates that there is insufficient evidence to suggest differences in the program's impact between small and big cities.
+
+The `listing_avg_review` model shows no statistical evidence of changes in customer expectations before and after the program's introduction. Notably however, post-implementation, average reviews in big cities are higher by 0.779 units on average, controlling for other factors.
+
+The control variables in the booking rate model behaved as expected, showing a positive effect overall, although the `super_host_ratio` variable did not yield statistically significant results. In the average review model, only `super_host_ratio` showed a significant result, indicating the anticipated positive effect.
+
+In summary, these results align with the hypotheses previously tested, with the models reinforcing the conclusions drawn: the program had a **significant impact in its first implementation** in San Francisco. However, there is **no evidence of a similar effect during the second implementation**. Additionally, there is **no evidence to suggest that the program significantly improved customer expectations**, as reflected in higher average reviews.
+
+```{r, include=FALSE}
+# Table with calculated effects
+br_inter <- data.frame(Group = c('1st impl', '2nd impl'))
+br_inter <- br_inter %>% mutate(Impact = if_else(Group == '1st impl', coef(br_fe)[1], coef(br_fe)[1] + coef(br_fe)[31]),
+                                Impact = round(Impact, 4)) %>% filter(Group != '1st impl, small city')
+
+knitr::kable(br_inter)
+```
+
+```{r, include=FALSE}
+rm(ar_robust_se, br_robust_se)
+gc()
+```
+
+# Assumptions and Model Diagnostics
+
+**MLR.1**: *The population model is linear in the parameters.*
+
+```{r, fig.height=2.5}
+data_panel$pred_br = predict(br_fe)
+data_panel <- data_panel %>% group_by(zipcode) %>% 
+  mutate(pred_var_br = pred_br - mean(booking_rate),
+         res_br = booking_rate - pred_br) %>% ungroup()
+
+linearity_br <- ggplot(tibble(data_panel), aes(x = pred_var_br, y = res_br)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(color = 'lightblue') +
+  theme_minimal() +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8)) +
+  labs(x = 'Fitted Values', y = 'Residuals', title = 'Linearity Check for Booking Rate model')
+
+data_panel$pred_avgr = predict(avg_re_fe)
+data_panel <- data_panel %>% group_by(zipcode) %>% 
+  mutate(pred_var_avgr = pred_avgr - mean(listing_avg_review),
+         res_avgr = listing_avg_review - pred_avgr) %>% ungroup()
+
+linearity_avgr <- ggplot(tibble(data_panel), aes(x = pred_var_avgr, y = res_avgr)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(color = 'lightblue') +
+  theme_minimal() +
+  theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8))+
+  labs(x = 'Fitted Values', y = 'Residuals', title = 'Linearity Check for Average Review model')
+
+linearity_br + linearity_avgr
+```
+
+The diagnostic plots suggest that both models meet this first assumption of linearity as the Residuals vs Fitted plots depict straight lines.
+
+```{r, include=FALSE}
+# Further investigation to linearity - residuals against each var used
+# For numeric vars do plots: price_mean, search_trend_airbnb, entire_ratio, super_host_ratio
+# For cat vars do tables: policy_entry, timeperiod, plus, big_city
+model_var <- data_panel %>% select(policy_entry, price_mean, search_trend_airbnb, timeperiod, plus, entire_ratio, big_city)
+
+
+p1 = ggplot(tibble(data_panel), aes(x = price_mean, y = res_br)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(color = 'lightblue') +
+  theme_minimal() +
+  labs(y = 'Residuals', title = 'Price Mean')
+p2 = ggplot(tibble(data_panel), aes(x = search_trend_airbnb, y = res_br)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(color = 'lightblue') +
+  theme_minimal() +
+  labs(y = 'Residuals', title = 'Search Trend')
+p3 = ggplot(tibble(data_panel), aes(x = entire_ratio, y = res_br)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(color = 'lightblue') +
+  theme_minimal() +
+  labs(y = 'Residuals', title = 'Entire Ratio')
+p4 = ggplot(tibble(data_panel), aes(x = super_host_ratio, y = res_br)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(color = 'lightblue') +
+  theme_minimal() +
+  labs(y = 'Residuals', title = 'Super Host Ratio')
+
+(p1 + p2) / (p3 + p4)
+
+res_policy <- data_panel %>% group_by(policy_entry) %>% summarise(n = n(), mean_res = mean(res_br)) 
+res_big <- data_panel %>% group_by(big_city) %>% summarise(n = n(), mean_res = mean(res_br))
+res_plus<- data_panel %>% group_by(plus) %>% summarise(n = n(), mean_res = mean(res_br))
+res_time <- data_panel %>% group_by(timeperiod) %>% summarise(n = n(), mean_res = mean(res_br))
+```
+
+```{r, include=FALSE}
+check_model(br_fe, check = 'linearity')
+check_model(avg_re_fe, check = 'linearity')
+```
+
+**MLR.2**: *Random sample of n observations.*
+
+The assumption of random sampling requires that the data used in the analysis is representative of the population of interest, with each observation independently and randomly drawn. We do lack explicit information about the data collection process, however, the data set is composed of aggregated Airbnb metrics across various U.S. zip codes and time periods, which suggests that the data is not systematically biased toward any particular subset of the population. In addition, no explicit evidence suggests that the data was collected in a way that would violate the independence or randomness of observations, making this assumption reasonable in our analysis.
+
+```{r, include=FALSE}
+# Random Sample investigation
+min_price = quantile(data_clean$price_mean, probs = 0.025, names = FALSE)
+max_price = quantile(data_clean$price_mean, probs = 0.975, names = FALSE)
+
+min_search = quantile(data_clean$search_trend_airbnb, probs = 0.025, names = FALSE)
+max_search = quantile(data_clean$search_trend_airbnb, probs = 0.975, names = FALSE)
+
+data_clean_outliers <- data_clean %>% 
+  mutate(price_mean = if_else(price_mean < min_price, min_price, 
+                      if_else(price_mean > max_price, max_price, price_mean)),
+         search_trend_airbnb = if_else(search_trend_airbnb < min_search, min_search, 
+                               if_else(search_trend_airbnb > max_search, max_search, search_trend_airbnb)))
+
+p1 = ggplot(data_clean, aes(x = price_mean, y = booking_rate)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(method='lm', color = 'lightblue') +
+  geom_smooth(method='lm', data = data_clean_outliers, aes(x = price_mean, y = booking_rate), color = 'red4')
+  theme_minimal() +
+    theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8)) + 
+  labs(y = 'Residuals', title = 'Price Mean')
+  
+p2 = ggplot(data_clean, aes(x = search_trend_airbnb, y = booking_rate)) + 
+  geom_point(color = 'grey50') + 
+  geom_smooth(method='lm', color = 'lightblue') +
+  geom_smooth(method='lm', data = data_clean_outliers, aes(x = search_trend_airbnb, y = booking_rate), color = 'red4')
+  theme_minimal() +
+    theme(text = element_text(size=10), legend.position= "bottom",
+       plot.title = element_text(size = 10),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 8)) + 
+  labs(y = 'Residuals', title = 'Search Trend')
+  
+p1 + p2
+```
+
+**MLR.3**: *None of the independent variables is constant, and there in no exact linear relationships among the independent variables (no perfect collinearity)*.
+
+```{r, fig.height=5}
+vif_data_br <- check_model(br_fe, check = 'vif')[[1]]
+vif_br <- ggplot(vif_data_br, aes(x = x, y = y, group = group, color = group)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c('lightgreen', 'lightblue')) +
+  geom_hline(yintercept = 5, linetype = "dashed", size = 1) +
+  geom_hline(yintercept = 10, linetype = "dashed", size = 1) +
+  ylim(0, 11) +
+  theme(text = element_text(size=10), legend.position= "none",
+        plot.title = element_text(size = 10),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 8), 
+        axis.text.x = element_text(size = 6, hjust = 1), 
+        axis.text.y = element_text(size = 8)) +
+  labs(title = "VIF - Booking Rate", y = "VIF Value") 
+
+vif_data_ar <- check_model(avg_re_fe, check = 'vif')[[1]]
+vif_ar <- ggplot(vif_data_ar, aes(x = x, y = y, group = group, color = group)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c('lightgreen', 'lightblue')) +
+  geom_hline(yintercept = 5, linetype = "dashed", size = 1) +
+  geom_hline(yintercept = 10, linetype = "dashed", size = 1) +
+  ylim(0, 11) + 
+  theme(text = element_text(size=10), legend.position= "bottom",
+        plot.title = element_text(size = 10),
+        axis.title.x = element_text(size = 8),
+        axis.title.y = element_text(size = 8), 
+        axis.text.x = element_text(size = 6, hjust = 1), 
+        axis.text.y = element_text(size = 8)) + 
+  labs(title = "VIF - Average Review", x = "Predictor Variables", y = "VIF Value") 
+
+vif_br / vif_ar
+```
+
+The VIF plot for both models show exactly the same values as all independent variables are common for both models.These plots show that most independent variables have VIF values below 5, indicating no significant multicollinearity issues. Only `time_period` displays a moderate but acceptable VIF value, as it is still below 10. This satisfies the MLR.3 assumption of no perfect
+collinearity, ensuring the model's stability. The predictors are moderately correlated, and standard errors are unlikely to be inflated.
+
+**MLR.4**: *The error $\epsilon$ has an expected value of zero given any values of the independent variables (zero conditional mean).*
+
+The `booking_rate` model could be influenced by time-varying factors *(hidden in the error term)* such as natural catastrophes, cultural events, or market characteristics *(e.g., competitors, new state regulations)*, which may correlate with explanatory variables and introduce bias. Negative booking rates in the data could suggest potential measurement errors in the explained variable, and measurement error in the explanatory variables are assumed to not exist. Reverse causality is a concern, as selection for policy implementation could depend on pre-existing booking rates, creating potential endogeneity. This selection bias could distort the estimated effect of `policy_entry`, reflecting correlation rather than causation. 
+
+The `listing_avg_review` model may be affected by omitted time-varying factors like local service quality or platform-level policy changes, which could introduce bias. No evidence suggests measurement errors or reverse causality in this model.
+
+**MLR.5**: *The error $\epsilon$ has the same variance given any values of the explanatory variables (homoskedasticity)*.
+
+```{r, include=FALSE}
+# Breusch-Pagan test for heteroskedasticity
+bptest(br_fe)
+bptest(avg_re_fe)
+```
+
+To diagnose heteroskedasticity, a Breusch-Pagan test was conducted for each model. At a 95% confidence level, both tests yielded very small p-values (<0.05), leading us to reject the null hypothesis of homoskedasticity. This indicates that the variance of the errors is not constant. However, the interpretations of the results remain valid, as the use of robust standard errors accounts for both heteroskedasticity and serial correlation.
+
+**MLR.6**: *The population error $\epsilon$ is independent of the explanatory variables and is normally distributed with zero mean and variance $\sigma^2$.*
+
+Since the sample used for modeling is large, the reliability of inference is supported by the Central Limit Theorem, which ensures that this assumption holds.
+
+
+```{r, include=FALSE}
+rm(data_clean_outliers, linearity_avgr, linearity_br, model_var, p1, p2, p3, p4, res_big, res_policy, res_time, res_plus, vif_ar, vif_br, vif_data_ar, vif_data_br, max_price, max_search, min_price, min_search)
+gc()
+```
+
+# Conclusions and Business Implications
+
+The central finding of the analysis challenges conventional assumptions about plus service upgrades. Contrary to expectations, the Airbnb Plus program did not lead to a significant improvement in customer satisfaction, measured by average reviews. However, the plus program showed evidence of a positive impact on booking rates in San Francisco, with an increase of 0.051 units post-implementation. In contrast, for the second launch of the plus program, cities did not experience significant changes, and on average a slight decline in booking rates. The results suggest that the success of the program in San Francisco may be related to the strong brand presence of Airbnb. The company was founded there and still locates its headquarters there *(Airbnb, 2024)*. These factors likely contributed to increased demand for plus listings. In other cities, the discrepancy of demographic and economic conditions may have limited the program's impact, emphasizing the importance of market-specific strategies for future roll-outs.
+
+Future launches should focus on leveraging existing brand strength and aligning service upgrades with market-specific demand to ensure both higher booking rates and improved customer satisfaction. Markets with strong brand presence, high tourism demand, and affluent customer bases are more likely to benefit from premium programs like Plus. Findings additionally challenge the assumption about customer satisfaction. The plus program failed to improve average listing reviews, reflecting the complexity of consumer profiles and behavior. Programs should be tailored to both customer expectations, such as improved service quality, as well as the regional market characteristics when launching future service upgrade initiatives.  
+
+The analysis of the Airbnb Plus program has significant implications for the hospitality and platform economy. It highlights the importance of more data-driven strategies, in order to understand regional market dynamics and optimizing premium service roll-outs. The findings have lead to an increased interest in exploring how local economic conditions, brand presence, and customer behavior influence the success of service upgrades as such. 
+
+\newpage
+**Limitations**
+
+*Data Quality*
+
++ The presence of missing observations introduces potential biases. Future studies would benefit from ensuring high-quality data collection from reliable sources as well as more explanation on how data got conducted and is to be interpreted. 
+
++ The reliance on aggregated zip-code-level data may obscure individual-level trends or insights.
+
+*Causal Inference* 
+
++ Although fixed-effects models help control for unobserved heterogeneity, potential endogeneity issues remain. For example, pre-existing booking trends could influence the selection of treated zip codes. More detailed data on how treated and non-treated zip codes were selected would strengthen causal interpretations.
+
+*Generalizability*
+
++ The findings may not generalize to all cities or time periods, particularly given the variability in program success across different markets.
+
+\vspace{60pt}
+*AI use note:* during this research the help of AI was used to debugging, layouts and text improvements.
+
+
+
+
+
+
+
+
